@@ -40,7 +40,7 @@ def launch(site, profile=None, visible=False):
             headless=not visible, accept_downloads=True)
     except Exception as exc:
         runtime.stop()
-        raise SyncError("Cannot start the dedicated browser. Close another olsync login/sync window. "
+        raise SyncError("Cannot start the dedicated browser. Close another ols login/sync window. "
                         "Install Chrome, or run playwright install chromium and set "
                         "OLSYNC_BROWSER_CHANNEL=chromium.") from exc
     return runtime, context
@@ -186,7 +186,7 @@ class WebTransport:
             self.__exit__()
             if isinstance(exc, SyncError):
                 raise
-            raise SyncError("Cannot open Overleaf. Run olsync login, then retry. "
+            raise SyncError("Cannot open Overleaf. Run ols login, then retry. "
                             "If a browser verification appears, complete it yourself with OLSYNC_VISIBLE=1.") from exc
 
     def __exit__(self, *args):
@@ -202,7 +202,7 @@ class WebTransport:
         deadline = time.monotonic() + 25
         while not self.project and time.monotonic() < deadline:
             if "/login" in self.page.url:
-                raise SyncError("Overleaf login required: run olsync login.")
+                raise SyncError("Overleaf login required: run ols login.")
             self.page.wait_for_timeout(100)
         if not self.project:
             raise SyncError("No project metadata received. Login/session expired or web API changed; nothing written.")

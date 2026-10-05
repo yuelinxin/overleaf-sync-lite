@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 sys.modules.setdefault("olsync", sys.modules[__name__])
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 STATE = ".overleaf-sync"
 MAX_FILE = 50 * 1024 * 1024
 MAX_TOTAL = 250 * 1024 * 1024
@@ -311,7 +311,7 @@ class Synchronizer:
             raise SyncError("State directory must not be a symlink.")
         self.config = read_json(self.state / "config.json")
         if not self.config or self.config.get("schema") != 1:
-            raise SyncError("Project not initialized; run olsync init first.")
+            raise SyncError("Project not initialized; run ols init first.")
         self.patterns = self.config["exclude"]
 
     @contextlib.contextmanager

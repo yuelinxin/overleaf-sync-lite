@@ -1,8 +1,10 @@
-# Overleaf Sync Lite
+# OLS (Overleaf Sync Lite)
 
 本地文件夹 ↔ Overleaf 的保守双向同步工具。**使用免费的网页下载/上传接口，不使用付费 Git bridge，也不需要 Overleaf Git token。**
 
-一次配置一个项目，日常只需 `olsync sync`。无需 git commit、分支或版本管理。Linux、macOS 和 Windows WSL；Python 3.10+，Chrome/Chromium。
+一次配置一个项目，日常只需 `ols sync`。无需 git commit、分支或版本管理。Linux、macOS 和 Windows WSL；Python 3.10+，Chrome/Chromium。
+
+通用命令为 `ols`；旧命令 `olsync` 保留为兼容入口。已有项目配置和登录状态可直接复用。
 
 ## 安装与登录
 
@@ -12,7 +14,7 @@ cd overleaf-sync-lite
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
-olsync login
+ols login
 ```
 
 `login` 打开**独立的浏览器配置目录**。在窗口里正常登录 Overleaf，完成验证码/SSO；看到项目列表后，回终端按 Enter。登录状态由浏览器保存在 `~/.config/overleaf-sync/<host>-browser/`，下次复用。程序不会读取日常 Chrome 的用户目录、密码或 cookie，也不会把认证信息写入论文项目或 GitHub。
@@ -22,19 +24,19 @@ olsync login
 ```bash
 python -m playwright install chromium
 export OLSYNC_BROWSER_CHANNEL=chromium
-olsync login
+ols login
 ```
 
-浏览器验证需要人工操作时：`OLSYNC_VISIBLE=1 olsync status`，或重新运行 `olsync login`。不绕过验证码。登录过期会停下并提示重新登录。
+浏览器验证需要人工操作时：`OLSYNC_VISIBLE=1 ols status`，或重新运行 `ols login`。不绕过验证码。登录过期会停下并提示重新登录。
 
 ## 连接一个项目
 
 ```bash
-olsync init --path ~/papers/my-paper \
+ols init --path ~/papers/my-paper \
   --project https://www.overleaf.com/project/YOUR_24_CHARACTER_PROJECT_ID
 
-olsync status --path ~/papers/my-paper   # 只预览
-olsync sync --path ~/papers/my-paper     # 双向同步
+ols status --path ~/papers/my-paper   # 只预览
+ols sync --path ~/papers/my-paper     # 双向同步
 ```
 
 也接受 24 位项目 ID。项目文件夹可为空：第一次同步会下载线上文件。已存在的文件夹也可以连接；初次同步同名文件内容不同时会报冲突，不按时间戳猜测哪一边更新。
@@ -43,8 +45,8 @@ olsync sync --path ~/papers/my-paper     # 双向同步
 
 ```bash
 cd ~/papers/my-paper
-olsync status
-olsync sync
+ols status
+ols sync
 ```
 
 每个文件夹独立存放 `.overleaf-sync/` 配置和同步基准，可以连接任意多个项目。不同账户可以用 `login --profile /absolute/profile/path` 和 `init --profile /absolute/profile/path` 配对；自托管站点可用 `login --site https://latex.example.org` 及该站点的 `/project/<id>` 地址。
@@ -81,10 +83,10 @@ CONFLICT: main.tex
 检查后可以明确选择一个文件的整份内容（包括该侧的删除状态）：
 
 ```bash
-olsync sync --take-local main.tex
-olsync sync --take-remote references.bib
+ols sync --take-local main.tex
+ols sync --take-remote references.bib
 # 先预览多个明确选择
-olsync sync --dry-run --take-local main.tex --take-remote references.bib
+ols sync --dry-run --take-local main.tex --take-remote references.bib
 ```
 
 也可以人工合并两侧，让同一文件内容一致后再运行 `sync`。不要删除 `.overleaf-sync/` 来“修复”冲突，这会丢失识别删除操作所需的同步基准。
@@ -104,7 +106,7 @@ UTF-8 文本（`.tex/.bib/.sty/.cls/.bst/.txt/.md/.csv/.tsv/.svg`）按 LF 换�
 初始化时增加排除规则：
 
 ```bash
-olsync init --path ~/papers/my-paper --project PROJECT_ID \
+ols init --path ~/papers/my-paper --project PROJECT_ID \
   --exclude 'notes/**' --exclude '*.private.tex'
 ```
 
@@ -117,7 +119,7 @@ olsync init --path ~/papers/my-paper --project PROJECT_ID \
 冲突预检失败时，本地和线上项目文件均不改变，仅记录诊断信息。同步中断会留下 `.overleaf-sync/pending.json` 以及相关内容对象：
 
 ```bash
-olsync recover
+ols recover
 ```
 
 恢复会核对每个文件仍是“操作前”或“计划结果”，补齐未完成部分；发现中断之后的新改动就停下并列出文件。请先把这些新改动复制到项目外保存，再决定如何完成旧操作。不要直接删除恢复文件。`.overleaf-sync/objects/` 是单次恢复数据，不是完整版本历史或长期备份。
@@ -129,8 +131,8 @@ olsync recover
 ## 调试与机器调用
 
 ```bash
-olsync status --json
-olsync sync --dry-run --json
+ols status --json
+ols sync --dry-run --json
 python -m unittest discover -s tests -v
 ```
 
@@ -139,10 +141,10 @@ python -m unittest discover -s tests -v
 可用两个普通文件夹测试整个同步流程，不需要登录或网络：
 
 ```bash
-mkdir -p /tmp/olsync-local /tmp/olsync-remote
-olsync init --path /tmp/olsync-local --project /tmp/olsync-remote
-echo 'hello' > /tmp/olsync-local/main.tex
-olsync sync --path /tmp/olsync-local
+mkdir -p /tmp/ols-local /tmp/ols-remote
+ols init --path /tmp/ols-local --project /tmp/ols-remote
+echo 'hello' > /tmp/ols-local/main.tex
+ols sync --path /tmp/ols-local
 ```
 
 ## 更新

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-lite"
-version = "0.1.0"
+version = "0.1.1"
 description = "Conservative two-way Overleaf sync using the free web interface"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = ["playwright>=1.45,<2"]
 license = {text = "MIT"}
 
 [project.scripts]
+ols = "olsync:main"
 olsync = "olsync:main"
 
 [tool.setuptools]
