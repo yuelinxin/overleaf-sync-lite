@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 sys.modules.setdefault("olsync", sys.modules[__name__])
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 STATE = ".overleaf-sync"
 MAX_FILE = 50 * 1024 * 1024
 MAX_TOTAL = 250 * 1024 * 1024
@@ -379,6 +379,30 @@ class Synchronizer:
             result[name] = Entry(data, record["mtime_ns"], record["mode"])
         return result
 
+    def archive_recovery(self, journal, local, remote):
+        """Keep the old plan and both current sides before replacing a recovery plan."""
+        parent = self.state / "recovery-backups"
+        parent.mkdir(mode=0o700, exist_ok=True)
+        archive = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"),
+                                        dir=parent))
+        save_json(archive / "pending.json", journal)
+        save_json(archive / "baseline.json", read_json(self.state / "baseline.json", {"files": {}}))
+        old_hashes = (set(journal["before"].values()) | set(journal["remote_before"].values())
+                      | set(journal["remote_target"].values()))
+        for sha in old_hashes:
+            if not re.fullmatch("[0-9a-f]{64}", sha):
+                raise SyncError("Invalid journal object hash; recovery plan retained.")
+            data = (self.state / "objects" / sha).read_bytes()
+            if digest(data) != sha:
+                raise SyncError("Damaged recovery data; recovery plan retained.")
+            atomic_write(archive / "objects" / sha, data)
+        for side, entries in (("local", local), ("overleaf", remote)):
+            for name, entry in entries.items():
+                atomic_write(path_at(archive / side, name), entry.data, mtime_ns=entry.mtime_ns)
+        save_json(archive / "snapshots.json", {"saved_at": now(), "local": hashes(local),
+                                                "overleaf": hashes(remote)})
+        return str(archive)
+
     def apply_local(self, journal, desired):
         before, target = journal["before"], hashes(desired)
         current = local_snapshot(self.root, self.patterns)
@@ -418,61 +442,103 @@ class Synchronizer:
             if obj.name not in set(target.values()):
                 obj.unlink()
 
+    def apply_plan(self, transport, local, remote, desired, actions, conflicts, dry_run,
+                   journal=None, replan=False):
+        report = {"project": str(self.root), "dry_run": dry_run, "actions": actions,
+                  "conflicts": conflicts, "recovery": journal is not None}
+        if conflicts:
+            save_json(self.state / "conflicts.json", report)
+            raise ConflictError(report)
+        self.preflight(desired, local)
+        transport.validate(desired)
+        if dry_run:
+            return report
+        if journal is not None and replan:
+            report["recovery_backup"] = self.archive_recovery(journal, local, remote)
+        self.preflight(desired, local)
+        if journal is None or replan:
+            journal = self.journal(local, remote, desired)
+        if hashes(desired) != hashes(remote):
+            transport.apply(remote, desired)
+        # A download-only run safely commits the snapshot we already fetched.
+        # Later remote edits are changes relative to that snapshot on the next sync.
+        # Re-exporting here used to strand harmless downloads in a recovery loop.
+        self.apply_local(journal, desired)
+        (self.state / "conflicts.json").unlink(missing_ok=True)
+        report["synced_at"] = now()
+        return report
+
     def sync(self, dry_run=False, take_local=(), take_remote=()):
         with self.lock():
             if (self.state / "pending.json").exists():
-                raise SyncError("Interrupted sync found. Run recover before another sync.")
+                return self.recover_locked(dry_run, take_local, take_remote)
             with self.transport() as transport:
                 remote = transport.snapshot()
                 local = local_snapshot(self.root, self.patterns)
                 desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote)
-                report = {"project": str(self.root), "dry_run": dry_run,
-                          "actions": actions, "conflicts": conflicts}
-                if conflicts:
-                    save_json(self.state / "conflicts.json", report)
-                    raise ConflictError(report)
-                self.preflight(desired, local)
-                transport.validate(desired)
-                if dry_run:
-                    return report
-                self.preflight(desired, local)
-                journal = self.journal(local, remote, desired)
-                if hashes(desired) != hashes(remote):
-                    transport.apply(remote, desired)
-                elif hashes(transport.snapshot()) != hashes(remote):
-                    raise SyncError("Overleaf changed during planning. Journal retained; run recover.")
-                self.apply_local(journal, desired)
-                (self.state / "conflicts.json").unlink(missing_ok=True)
-                report["synced_at"] = now()
-                return report
+                return self.apply_plan(transport, local, remote, desired, actions, conflicts, dry_run)
 
-    def recover(self):
+    def recover(self, dry_run=False, take_local=(), take_remote=()):
         with self.lock():
-            journal = read_json(self.state / "pending.json")
-            if journal is None:
-                return {"message": "No interrupted sync to recover."}
-            desired = self.journal_entries(journal)
-            current = hashes(local_snapshot(self.root, self.patterns))
-            target = hashes(desired)
-            changed = [p for p in sorted(set(current) | set(target) | set(journal["before"]))
-                       if current.get(p) not in {journal["before"].get(p), target.get(p)}]
-            if changed:
-                raise SyncError("Local files changed since interruption: " + ", ".join(changed)
-                                + ". Preserve these edits before recovery.")
-            with self.transport() as transport:
-                remote = transport.snapshot()
-                rh = hashes(remote)
-                changed = [p for p in sorted(set(rh) | set(target) | set(journal["remote_before"]))
-                           if rh.get(p) not in {journal["remote_before"].get(p), target.get(p)}]
-                if changed:
-                    raise SyncError("Overleaf changed since interruption: " + ", ".join(changed)
-                                    + ". Journal retained; preserve these edits before recovery.")
-                self.preflight(desired, local_snapshot(self.root, self.patterns))
-                transport.validate(desired)
-                if rh != target:
-                    transport.apply(remote, desired)
-                self.apply_local(journal, desired)
-                return {"message": "Recovery completed."}
+            return self.recover_locked(dry_run, take_local, take_remote)
+
+    def recover_locked(self, dry_run=False, take_local=(), take_remote=()):
+        journal = read_json(self.state / "pending.json")
+        if journal is None:
+            return {"message": "No interrupted sync to recover."}
+        desired = self.journal_entries(journal)
+        local = local_snapshot(self.root, self.patterns)
+        lh, target = hashes(local), hashes(desired)
+        with self.transport() as transport:
+            remote = transport.snapshot()
+            rh = hashes(remote)
+            if journal["remote_before"] == target and lh == journal["before"] and rh != target:
+                # No uploads were planned and no local writes remain. Replan against
+                # the real baseline, so divergent edits still require a fresh choice.
+                desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote)
+                return self.apply_plan(transport, local, remote, desired, actions, conflicts,
+                                       dry_run, journal, replan=True)
+
+            names = set(lh) | set(rh) | set(target) | set(journal["before"]) | set(journal["remote_before"])
+            choices_l, choices_r = set(take_local), set(take_remote)
+            if choices_l & choices_r:
+                raise SyncError("Cannot choose both sides of the same file.")
+            if (choices_l | choices_r) - names:
+                raise SyncError("Resolution path not found: " + ", ".join(sorted((choices_l | choices_r) - names)))
+            conflicts, actions = [], []
+            replan = bool(choices_l or choices_r)
+            for name in sorted(names):
+                changed = []
+                if lh.get(name) not in {journal["before"].get(name), target.get(name)}:
+                    changed.append("local")
+                if rh.get(name) not in {journal["remote_before"].get(name), target.get(name)}:
+                    changed.append("Overleaf")
+                if name in choices_l:
+                    chosen = local.get(name)
+                elif name in choices_r:
+                    chosen = remote.get(name)
+                elif changed and lh.get(name) == rh.get(name):
+                    chosen = local.get(name)
+                    replan = True
+                elif changed:
+                    detail = conflict_detail(name, local, remote)
+                    detail["changed_since_interruption"] = changed
+                    conflicts.append(detail)
+                    continue
+                else:
+                    chosen = desired.get(name)
+                if chosen is None:
+                    desired.pop(name, None)
+                else:
+                    desired[name] = chosen
+                wanted = chosen.sha if chosen else None
+                for side, previous in (("local", lh.get(name)), ("overleaf", rh.get(name))):
+                    if previous != wanted:
+                        actions.append({"path": name, "side": side,
+                                        "action": "delete" if wanted is None else ("add" if previous is None else "update"),
+                                        "modified_utc": stamp(chosen.mtime_ns) if chosen else None})
+            return self.apply_plan(transport, local, remote, desired, actions, conflicts,
+                                   dry_run, journal, replan)
 
 
 def initialize(root, remote, excludes=(), profile=None):
@@ -503,9 +569,11 @@ def print_report(report, json_output=False):
         return
     conflicts = report.get("conflicts", [])
     if conflicts:
-        print(f"STOP: {len(conflicts)} conflict(s). No project files changed locally or on Overleaf.")
+        print(f"STOP: {len(conflicts)} conflict(s). No project files changed by this run.")
         for item in conflicts:
             print("\nCONFLICT: " + item["path"])
+            if item.get("changed_since_interruption"):
+                print("Changed since interruption: " + ", ".join(item["changed_since_interruption"]))
             if "reason" in item:
                 print(item["reason"])
             elif item.get("binary"):
@@ -517,13 +585,16 @@ def print_report(report, json_output=False):
                 print("\n".join(item.get("diff", [])))
                 if item.get("truncated"):
                     print("… diff abbreviated")
-        print("\nCompare both files, then run sync --take-local FILE or --take-remote FILE.")
+        command = "recover" if report.get("recovery") else "sync"
+        print(f"\nCompare both files, then run ols {command} --take-local FILE or --take-remote FILE.")
     else:
         print("Preview (no project file changes):" if report.get("dry_run") else "Sync complete:")
         for item in report.get("actions", []):
             print(f"  {item['side']:8s} {item['action']:6s} {item['path']}")
         if not report.get("actions"):
             print("  Already in sync.")
+        if report.get("recovery_backup"):
+            print("Recovery backup:", report["recovery_backup"])
 
 
 def main(argv=None):
@@ -542,7 +613,7 @@ def main(argv=None):
             sub.add_argument("--project", required=True, help="Overleaf project URL/id (free web transport)")
             sub.add_argument("--profile", help="Browser profile directory used by login")
             sub.add_argument("--exclude", action="append", default=[], help="Additional glob to ignore")
-        if name == "sync":
+        if name in {"sync", "recover"}:
             sub.add_argument("--dry-run", action="store_true")
             sub.add_argument("--take-local", action="append", default=[], metavar="FILE")
             sub.add_argument("--take-remote", action="append", default=[], metavar="FILE")
@@ -555,7 +626,7 @@ def main(argv=None):
         elif args.command == "init":
             report = initialize(args.path, args.project, args.exclude, args.profile)
         elif args.command == "recover":
-            report = Synchronizer(args.path).recover()
+            report = Synchronizer(args.path).recover(args.dry_run, args.take_local, args.take_remote)
         else:
             report = Synchronizer(args.path).sync(
                 dry_run=args.command == "status" or getattr(args, "dry_run", False),

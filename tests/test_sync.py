@@ -234,6 +234,194 @@ class SyncTests(unittest.TestCase):
             self.sync.recover()
         self.assertEqual((self.remote / "main.tex").read_text(), "new remote edits")
 
+    def interrupted_pull(self):
+        self.seed()
+        self.write(self.remote, "main.tex", "remote v1")
+        with patch.object(self.sync, "apply_local", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self.sync.sync()
+
+    def test_pull_commits_snapshot_without_reexport_or_remote_write(self):
+        self.seed()
+        self.write(self.remote, "main.tex", "remote v1")
+        original = s.DirectoryTransport.snapshot
+        calls = []
+
+        def moving_remote(transport):
+            result = original(transport)
+            calls.append(1)
+            self.write(self.remote, "main.tex", "remote v2")
+            return result
+        with patch.object(s.DirectoryTransport, "snapshot", moving_remote), \
+                patch.object(s.DirectoryTransport, "apply") as apply:
+            self.sync.sync()
+        self.assertEqual(len(calls), 1)
+        apply.assert_not_called()
+        self.assertEqual((self.local / "main.tex").read_text(), "remote v1")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+        self.sync.sync()
+        self.assertEqual((self.local / "main.tex").read_text(), "remote v2")
+
+    def test_old_untouched_pull_recovers_latest_remote_and_archives_plan(self):
+        self.interrupted_pull()
+        old = (self.sync.state / "pending.json").read_bytes()
+        self.write(self.remote, "main.tex", "remote v2")
+        with patch.object(s.DirectoryTransport, "apply") as apply:
+            report = self.sync.recover()
+        apply.assert_not_called()
+        self.assertEqual((self.local / "main.tex").read_text(), "remote v2")
+        archive = Path(report["recovery_backup"])
+        self.assertEqual((archive / "pending.json").read_bytes(), old)
+        self.assertEqual((archive / "local/main.tex").read_text(), "one\ntwo\nthree\n")
+        self.assertEqual((archive / "overleaf/main.tex").read_text(), "remote v2")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_sync_can_resume_pending_pull_and_status_does_not_change_plan(self):
+        self.interrupted_pull()
+        self.write(self.remote, "main.tex", "remote v2")
+        before = (self.sync.state / "pending.json").read_bytes()
+        report = self.sync.sync(dry_run=True)
+        self.assertTrue(report["recovery"])
+        self.assertEqual(report["actions"][0]["side"], "local")
+        self.assertEqual((self.sync.state / "pending.json").read_bytes(), before)
+        self.assertFalse((self.sync.state / "recovery-backups").exists())
+        self.assertEqual((self.local / "main.tex").read_text(), "one\ntwo\nthree\n")
+        self.sync.sync()
+        self.assertEqual((self.local / "main.tex").read_text(), "remote v2")
+
+    def test_recovery_does_not_reuse_old_force_remote_choice(self):
+        self.seed()
+        self.write(self.local, "main.tex", "my edits")
+        self.write(self.remote, "main.tex", "remote v1")
+        with patch.object(self.sync, "apply_local", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self.sync.sync(take_remote=["main.tex"])
+        self.write(self.remote, "main.tex", "remote v2")
+        with self.assertRaises(s.ConflictError) as caught:
+            self.sync.recover()
+        diff = "\n".join(caught.exception.report["conflicts"][0]["diff"])
+        self.assertIn("-my edits", diff)
+        self.assertIn("+remote v2", diff)
+        self.assertEqual((self.local / "main.tex").read_text(), "my edits")
+
+    def test_recovery_keeps_prior_choice_when_remote_content_is_unchanged(self):
+        self.seed()
+        self.write(self.local, "main.tex", "my edits")
+        self.write(self.remote, "main.tex", "chosen remote")
+        with patch.object(self.sync, "apply_local", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self.sync.sync(take_remote=["main.tex"])
+        self.sync.recover()
+        self.assertEqual((self.local / "main.tex").read_text(), "chosen remote")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_recovery_take_remote_preserves_new_local_edits_in_backup(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "my new edits")
+        self.write(self.remote, "main.tex", "remote v2")
+        report = self.sync.recover(take_remote=["main.tex"])
+        self.assertEqual((self.local / "main.tex").read_text(), "remote v2")
+        archive = Path(report["recovery_backup"])
+        self.assertEqual((archive / "local/main.tex").read_text(), "my new edits")
+        self.assertEqual((archive / "overleaf/main.tex").read_text(), "remote v2")
+
+    def test_recovery_take_local_preserves_remote_and_updates_both(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "my new edits")
+        self.write(self.remote, "main.tex", "remote v2")
+        report = self.sync.recover(take_local=["main.tex"])
+        self.assertEqual((self.remote / "main.tex").read_text(), "my new edits")
+        self.assertEqual((Path(report["recovery_backup"]) / "overleaf/main.tex").read_text(), "remote v2")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_recovery_cli_dry_run_with_choice_does_not_write(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "new edits")
+        before = (self.sync.state / "pending.json").read_bytes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = s.main(["recover", "--path", str(self.local), "--dry-run",
+                           "--take-remote", "main.tex", "--json"])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output.getvalue())["dry_run"])
+        self.assertEqual((self.sync.state / "pending.json").read_bytes(), before)
+        self.assertEqual((self.local / "main.tex").read_text(), "new edits")
+
+    def test_recovery_unresolved_file_aborts_other_choices(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "new local")
+        self.write(self.remote, "main.tex", "new remote")
+        self.write(self.local, "other.tex", "new other")
+        before = (self.sync.state / "pending.json").read_bytes()
+        with self.assertRaises(s.ConflictError) as caught:
+            self.sync.recover(take_remote=["main.tex"])
+        self.assertEqual(caught.exception.report["conflicts"][0]["path"], "other.tex")
+        self.assertEqual((self.local / "main.tex").read_text(), "new local")
+        self.assertEqual((self.sync.state / "pending.json").read_bytes(), before)
+        self.assertFalse((self.sync.state / "recovery-backups").exists())
+
+    def test_recovery_accepts_identical_new_edits_on_both_sides(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "identical new version")
+        self.write(self.remote, "main.tex", "identical new version")
+        self.sync.recover()
+        self.assertEqual((self.local / "main.tex").read_text(), "identical new version")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_recovery_explicit_remote_deletion_is_backed_up(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "my new edits")
+        (self.remote / "main.tex").unlink()
+        with self.assertRaises(s.ConflictError):
+            self.sync.recover()
+        report = self.sync.recover(take_remote=["main.tex"])
+        self.assertFalse((self.local / "main.tex").exists())
+        self.assertEqual((Path(report["recovery_backup"]) / "local/main.tex").read_text(), "my new edits")
+
+    def test_local_edit_during_recovery_backup_retains_old_journal(self):
+        self.interrupted_pull()
+        self.write(self.remote, "main.tex", "remote v2")
+        before = (self.sync.state / "pending.json").read_bytes()
+        original = self.sync.archive_recovery
+
+        def changed(*args):
+            result = original(*args)
+            self.write(self.local, "main.tex", "editing during backup")
+            return result
+        with patch.object(self.sync, "archive_recovery", changed), self.assertRaises(s.SyncError):
+            self.sync.recover()
+        self.assertEqual((self.sync.state / "pending.json").read_bytes(), before)
+        self.assertEqual((self.local / "main.tex").read_text(), "editing during backup")
+
+    def test_new_recovery_plan_can_recover_after_another_interruption(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "my new edits")
+        self.write(self.remote, "main.tex", "remote v2")
+        with patch.object(self.sync, "apply_local", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self.sync.recover(take_local=["main.tex"])
+        self.assertEqual((self.remote / "main.tex").read_text(), "my new edits")
+        self.sync.recover()
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_recovery_invalid_choices_keep_journal(self):
+        self.interrupted_pull()
+        self.write(self.local, "main.tex", "my new edits")
+        before = (self.sync.state / "pending.json").read_bytes()
+        for left, right in [(["main.tex"], ["main.tex"]), (["missing.tex"], [])]:
+            with self.assertRaises(s.SyncError):
+                self.sync.recover(take_local=left, take_remote=right)
+        self.assertEqual((self.sync.state / "pending.json").read_bytes(), before)
+
+    def test_pull_does_not_overwrite_local_edit_during_apply(self):
+        self.seed()
+        self.write(self.remote, "main.tex", "remote v1")
+        original = self.sync.apply_local
+
+        def edited(*args):
+            self.write(self.local, "main.tex", "new local edit")
+            return original(*args)
+        with patch.object(self.sync, "apply_local", edited), self.assertRaises(s.SyncError):
+            self.sync.sync()
+        self.assertEqual((self.local / "main.tex").read_text(), "new local edit")
+        self.assertTrue((self.sync.state / "pending.json").exists())
+
     def test_multiple_projects_are_isolated(self):
         other = Path(self.temp.name) / "other"
         remote = Path(self.temp.name) / "other_remote"
