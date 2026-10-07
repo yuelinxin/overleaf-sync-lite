@@ -16,14 +16,17 @@ import re
 import stat
 import sys
 import tempfile
+from time import time_ns
 from urllib.parse import urlsplit
 
 sys.modules.setdefault("olsync", sys.modules[__name__])
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 STATE = ".overleaf-sync"
 MAX_FILE = 50 * 1024 * 1024
 MAX_TOTAL = 250 * 1024 * 1024
+MAX_MERGE_BYTES = 2 * 1024 * 1024
+MAX_MERGE_LINES = 10_000
 TEXT_SUFFIXES = {'.tex', '.bib', '.sty', '.cls', '.bst', '.txt', '.md', '.csv', '.tsv', '.svg'}
 DEFAULT_EXCLUDES = [
     ".*", "backups", "output", "build", "dist", "tmp", "node_modules",
@@ -240,6 +243,90 @@ class DirectoryTransport:
 
 
 
+def merge_text(name, base, local, remote):
+    """Merge only disjoint line edits against verified common content; never add markers."""
+    if PurePosixPath(name).suffix.lower() not in TEXT_SUFFIXES:
+        return None
+    data = (base, local.data, remote.data)
+    if any(len(value) > MAX_MERGE_BYTES or b"\0" in value for value in data):
+        return None
+    try:
+        original, left, right = [value.decode("utf-8").splitlines(keepends=True) for value in data]
+    except UnicodeError:
+        return None
+    if any(len(lines) > MAX_MERGE_LINES for lines in (original, left, right)):
+        return None
+
+    def edits(lines):
+        return [(i, j, tuple(lines[k:l])) for tag, i, j, k, l in
+                difflib.SequenceMatcher(None, original, lines).get_opcodes() if tag != "equal"]
+
+    a, b = edits(left), edits(right)
+    i = j = 0
+    while i < len(a) and j < len(b):
+        x, y = a[i], b[j]
+        if x == y:
+            i, j = i + 1, j + 1
+            continue
+        # Insertions at a changed range's boundary have ambiguous ordering.
+        if x[0] == x[1]:
+            overlaps = y[0] <= x[0] <= y[1]
+        elif y[0] == y[1]:
+            overlaps = x[0] <= y[0] <= x[1]
+        else:
+            overlaps = max(x[0], y[0]) < min(x[1], y[1])
+        if overlaps:
+            return None
+        if x[1] <= y[0]:
+            i += 1
+        else:
+            j += 1
+    result, cursor = [], 0
+    for start, end, replacement in sorted(set(a + b)):
+        if start < cursor:
+            return None
+        result.extend(original[cursor:start])
+        result.extend(replacement)
+        cursor = end
+    result.extend(original[cursor:])
+    merged = "".join(result).encode("utf-8")
+    return Entry(merged, time_ns(), local.mode)
+
+
+def brief_diff(diff, width=240, limit=28):
+    """Center paired long replacement lines around the first actual difference."""
+    offsets = {}
+    i = 0
+    while i < len(diff):
+        if not diff[i].startswith("-") or diff[i].startswith("---"):
+            i += 1
+            continue
+        first = i
+        while i < len(diff) and diff[i].startswith("-") and not diff[i].startswith("---"):
+            i += 1
+        middle = i
+        while i < len(diff) and diff[i].startswith("+") and not diff[i].startswith("+++"):
+            i += 1
+        for a, b in zip(range(first, middle), range(middle, i)):
+            left, right = diff[a][1:], diff[b][1:]
+            prefix = 0
+            while prefix < min(len(left), len(right)) and left[prefix] == right[prefix]:
+                prefix += 1
+            offsets[a] = offsets[b] = max(0, prefix - 60)
+    result, truncated = [], len(diff) > limit
+    for index, line in enumerate(diff[:limit]):
+        if len(line) <= width:
+            result.append(line)
+            continue
+        start = offsets.get(index, 0)
+        text = line[1:]
+        head = line[:1] + ("… " if start else "")
+        end = start + width - len(head) - 1
+        result.append(head + text[start:end] + ("…" if end < len(text) else ""))
+        truncated = True
+    return result, truncated
+
+
 def conflict_detail(name, local, remote):
     a, b = local.get(name), remote.get(name)
     info = {"path": name, "local_sha256": a.sha if a else None,
@@ -254,8 +341,7 @@ def conflict_detail(name, local, remote):
         diff = list(difflib.unified_diff(atext.splitlines(), btext.splitlines(),
                     fromfile="local/" + name if a else "local/(deleted)",
                     tofile="overleaf/" + name if b else "overleaf/(deleted)", n=2, lineterm=""))
-        info["diff"] = [line[:240] + ("…" if len(line) > 240 else "") for line in diff[:28]]
-        info["truncated"] = len(diff) > 28 or any(len(line) > 240 for line in diff[:28])
+        info["diff"], info["truncated"] = brief_diff(diff)
     except UnicodeError:
         info["binary"] = True
         info["local_bytes"] = len(a.data) if a else 0
@@ -263,7 +349,7 @@ def conflict_detail(name, local, remote):
     return info
 
 
-def plan(baseline, local, remote, take_local=(), take_remote=()):
+def plan(baseline, local, remote, take_local=(), take_remote=(), read_base=None):
     lh, rh = hashes(local), hashes(remote)
     desired, actions, conflicts = {}, [], []
     choices_l, choices_r = set(take_local), set(take_remote)
@@ -274,6 +360,7 @@ def plan(baseline, local, remote, take_local=(), take_remote=()):
         raise SyncError("Resolution path not found: " + ", ".join(sorted((choices_l | choices_r) - names)))
     for name in sorted(names):
         base, left, right = baseline.get(name), lh.get(name), rh.get(name)
+        merged = False
         if left == right:
             chosen = local.get(name)
         elif name in choices_l:
@@ -285,8 +372,12 @@ def plan(baseline, local, remote, take_local=(), take_remote=()):
         elif right == base:
             chosen = local.get(name)
         else:
-            conflicts.append(conflict_detail(name, local, remote))
-            continue
+            content = read_base(base) if read_base and base and left and right else None
+            chosen = merge_text(name, content, local[name], remote[name]) if content is not None else None
+            if chosen is None:
+                conflicts.append(conflict_detail(name, local, remote))
+                continue
+            merged = True
         if chosen is not None:
             desired[name] = chosen
         target = chosen.sha if chosen else None
@@ -295,6 +386,8 @@ def plan(baseline, local, remote, take_local=(), take_remote=()):
                 actions.append({"path": name, "side": side,
                                 "action": "delete" if target is None else ("add" if previous is None else "update"),
                                 "modified_utc": stamp(chosen.mtime_ns) if chosen else None})
+                if merged:
+                    actions[-1]["auto_merged"] = True
     # File-vs-directory cases are intentionally stopped, even if a rename could be inferred.
     for name in sorted(desired):
         for parent in PurePosixPath(name).parents:
@@ -337,6 +430,30 @@ class Synchronizer:
     def baseline(self):
         state = read_json(self.state / "baseline.json", {"files": {}})
         return {p: e["sha256"] for p, e in state["files"].items()}
+
+    def read_base(self, sha):
+        if not re.fullmatch("[0-9a-f]{64}", sha):
+            return None
+        path = self.state / "objects" / sha
+        if not path.is_file() or path.stat().st_size > MAX_MERGE_BYTES:
+            return None
+        data = path.read_bytes()
+        return data if digest(data) == sha else None
+
+    def archive_merge(self, names, local, remote, desired):
+        parent = self.state / "merge-backups"
+        parent.mkdir(mode=0o700, exist_ok=True)
+        archive = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"),
+                                        dir=parent))
+        baseline = self.baseline()
+        for name in names:
+            base = self.read_base(baseline[name])
+            if base is None:
+                raise SyncError("Common base disappeared; refusing to apply automatic merge.")
+            atomic_write(path_at(archive / "base", name), base)
+            for side, entries in (("local", local), ("overleaf", remote), ("merged", desired)):
+                atomic_write(path_at(archive / side, name), entries[name].data)
+        return str(archive)
 
     def preflight(self, desired, local):
         for name in desired:
@@ -446,6 +563,7 @@ class Synchronizer:
                    journal=None, replan=False):
         report = {"project": str(self.root), "dry_run": dry_run, "actions": actions,
                   "conflicts": conflicts, "recovery": journal is not None}
+        report["auto_merged"] = sorted({a["path"] for a in actions if a.get("auto_merged")})
         if conflicts:
             save_json(self.state / "conflicts.json", report)
             raise ConflictError(report)
@@ -453,6 +571,8 @@ class Synchronizer:
         transport.validate(desired)
         if dry_run:
             return report
+        if report["auto_merged"]:
+            report["merge_backup"] = self.archive_merge(report["auto_merged"], local, remote, desired)
         if journal is not None and replan:
             report["recovery_backup"] = self.archive_recovery(journal, local, remote)
         self.preflight(desired, local)
@@ -475,7 +595,8 @@ class Synchronizer:
             with self.transport() as transport:
                 remote = transport.snapshot()
                 local = local_snapshot(self.root, self.patterns)
-                desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote)
+                desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote,
+                                                   read_base=self.read_base)
                 return self.apply_plan(transport, local, remote, desired, actions, conflicts, dry_run)
 
     def recover(self, dry_run=False, take_local=(), take_remote=()):
@@ -495,7 +616,8 @@ class Synchronizer:
             if journal["remote_before"] == target and lh == journal["before"] and rh != target:
                 # No uploads were planned and no local writes remain. Replan against
                 # the real baseline, so divergent edits still require a fresh choice.
-                desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote)
+                desired, actions, conflicts = plan(self.baseline(), local, remote, take_local, take_remote,
+                                                   read_base=self.read_base)
                 return self.apply_plan(transport, local, remote, desired, actions, conflicts,
                                        dry_run, journal, replan=True)
 
@@ -589,12 +711,16 @@ def print_report(report, json_output=False):
         print(f"\nCompare both files, then run ols {command} --take-local FILE or --take-remote FILE.")
     else:
         print("Preview (no project file changes):" if report.get("dry_run") else "Sync complete:")
+        for name in report.get("auto_merged", []):
+            print(f"  Auto-merge: {name} (non-overlapping line changes)")
         for item in report.get("actions", []):
             print(f"  {item['side']:8s} {item['action']:6s} {item['path']}")
         if not report.get("actions"):
             print("  Already in sync.")
         if report.get("recovery_backup"):
             print("Recovery backup:", report["recovery_backup"])
+        if report.get("merge_backup"):
+            print("Merge backup:", report["merge_backup"])
 
 
 def main(argv=None):

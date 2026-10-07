@@ -55,6 +55,105 @@ class SyncTests(unittest.TestCase):
         self.assertEqual((self.remote / "main.tex").read_text(), "local edit")
         self.assertEqual((self.local / "refs.bib").read_text(), "remote new")
 
+    def test_nonoverlapping_changes_merge_both_sides_and_keep_backup(self):
+        self.seed()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        report = self.sync.sync()
+        self.assertEqual(report["auto_merged"], ["main.tex"])
+        for root in (self.local, self.remote):
+            self.assertEqual((root / "main.tex").read_text(), "LOCAL\ntwo\nREMOTE\n")
+        archive = Path(report["merge_backup"])
+        self.assertEqual((archive / "base/main.tex").read_text(), "one\ntwo\nthree\n")
+        self.assertEqual((archive / "local/main.tex").read_text(), "LOCAL\ntwo\nthree\n")
+        self.assertEqual((archive / "overleaf/main.tex").read_text(), "one\ntwo\nREMOTE\n")
+        self.assertEqual(self.sync.sync()["actions"], [])
+
+    def test_merge_preview_changes_no_files_and_creates_no_backup(self):
+        self.seed()
+        before = (self.sync.state / "baseline.json").read_bytes()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        report = self.sync.sync(dry_run=True)
+        self.assertEqual(report["auto_merged"], ["main.tex"])
+        self.assertFalse((self.sync.state / "merge-backups").exists())
+        self.assertFalse((self.sync.state / "pending.json").exists())
+        self.assertEqual((self.sync.state / "baseline.json").read_bytes(), before)
+        self.assertEqual((self.local / "main.tex").read_text(), "LOCAL\ntwo\nthree\n")
+        self.assertEqual((self.remote / "main.tex").read_text(), "one\ntwo\nREMOTE\n")
+
+    def test_missing_or_damaged_base_falls_back_to_conflict(self):
+        self.seed()
+        obj = self.sync.state / "objects" / self.sync.baseline()["main.tex"]
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        for content in (None, b"corrupt"):
+            if content is None:
+                obj.unlink()
+            else:
+                obj.write_bytes(content)
+            with self.assertRaises(s.ConflictError):
+                self.sync.sync()
+            self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_explicit_choice_overrides_automatic_merge(self):
+        self.seed()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        report = self.sync.sync(take_local=["main.tex"])
+        self.assertEqual(report["auto_merged"], [])
+        self.assertEqual((self.remote / "main.tex").read_text(), "LOCAL\ntwo\nthree\n")
+
+    def test_conflict_in_another_file_blocks_merge_before_any_write(self):
+        self.seed()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        self.write(self.local, "other.tex", "left")
+        self.write(self.remote, "other.tex", "right")
+        with self.assertRaises(s.ConflictError):
+            self.sync.sync()
+        self.assertEqual((self.remote / "main.tex").read_text(), "one\ntwo\nREMOTE\n")
+        self.assertFalse((self.sync.state / "merge-backups").exists())
+
+    def test_interrupted_merge_can_recover_exact_combined_content(self):
+        self.seed()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        with patch.object(self.sync, "apply_local", side_effect=OSError("crash")), self.assertRaises(OSError):
+            self.sync.sync()
+        self.assertEqual((self.remote / "main.tex").read_text(), "LOCAL\ntwo\nREMOTE\n")
+        self.sync.recover()
+        self.assertEqual((self.local / "main.tex").read_text(), "LOCAL\ntwo\nREMOTE\n")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_local_edit_during_merge_backup_is_not_overwritten(self):
+        self.seed()
+        self.write(self.local, "main.tex", "LOCAL\ntwo\nthree\n")
+        self.write(self.remote, "main.tex", "one\ntwo\nREMOTE\n")
+        original = self.sync.archive_merge
+
+        def edited(*args):
+            result = original(*args)
+            self.write(self.local, "main.tex", "editing during backup")
+            return result
+        with patch.object(self.sync, "archive_merge", edited), self.assertRaises(s.SyncError):
+            self.sync.sync()
+        self.assertEqual((self.local / "main.tex").read_text(), "editing during backup")
+        self.assertEqual((self.remote / "main.tex").read_text(), "one\ntwo\nREMOTE\n")
+        self.assertFalse((self.sync.state / "pending.json").exists())
+
+    def test_long_line_conflict_excerpt_shows_changed_text(self):
+        prefix = "identical prefix " * 40
+        self.write(self.local, "main.tex", prefix + "LOCAL CHOICE" + " suffix" * 40)
+        self.write(self.remote, "main.tex", prefix + "REMOTE CHOICE" + " suffix" * 40)
+        with self.assertRaises(s.ConflictError) as caught:
+            self.sync.sync()
+        detail = caught.exception.report["conflicts"][0]
+        self.assertIn("LOCAL CHOICE", "\n".join(detail["diff"]))
+        self.assertIn("REMOTE CHOICE", "\n".join(detail["diff"]))
+        self.assertTrue(detail["truncated"])
+        self.assertTrue(all(len(line) <= 240 for line in detail["diff"]))
+
     def test_conflict_aborts_entire_plan_and_lists_lines(self):
         self.seed()
         self.write(self.local, "main.tex", "one\nLOCAL\nthree\n")
@@ -440,6 +539,56 @@ class SyncTests(unittest.TestCase):
             code = s.main(["sync", "--path", str(self.local), "--json"])
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(output.getvalue())["conflicts"][0]["path"], "main.tex")
+
+
+class MergeTests(unittest.TestCase):
+    def merge(self, base, left, right, name="main.tex"):
+        value = s.merge_text(name, base.encode(), s.Entry(left.encode(), 1), s.Entry(right.encode(), 2))
+        return value.data.decode() if value is not None else None
+
+    def test_line_merge_cases(self):
+        cases = [
+            ("a\nb\nc\nd\n", "A\nb\nc\nd\n", "a\nb\nc\nD\n", "A\nb\nc\nD\n"),
+            ("a\nb\nc\nd\n", "a\nB\nc\nd\n", "a\nb\nC\nd\n", "a\nB\nC\nd\n"),
+            ("a\nb\nc\nd\n", "a\nnew\nb\nc\nd\n", "a\nb\nc\nother\nd\n", "a\nnew\nb\nc\nother\nd\n"),
+            ("a\nb\nc\nd\n", "a\nc\nd\n", "a\nb\nc\nD\n", "a\nc\nD\n"),
+            ("a\nb\nc\nd\ne\n", "a\nB\nc\nD\ne\n", "a\nB\nc\nd\nE\n", "a\nB\nc\nD\nE\n"),
+            ("a\nb\nc\nd", "A\nb\nc\nd", "a\nb\nc\nd\n", "A\nb\nc\nd\n"),
+            ("甲\n乙\n丙\n", "甲改\n乙\n丙\n", "甲\n乙\n丙改\n", "甲改\n乙\n丙改\n"),
+            ("a\nb\nc\n", "a\nLEFT\nc\n", "a\nRIGHT\nc\n", None),
+            ("a\nb\nc\n", "a\nnew\nb\nc\n", "a\nother\nb\nc\n", None),
+            ("a\nb\nc\n", "a\nc\n", "a\nB\nc\n", None),
+            ("a\nb\nc\nd\n", "a\nx\nd\n", "a\nb\nC\nd\n", None),
+            ("a\nb\nc\n", "a\nnew\nb\nc\n", "a\nB\nc\n", None),
+        ]
+        for base, left, right, expected in cases:
+            with self.subTest(base=base, left=left, right=right):
+                self.assertEqual(self.merge(base, left, right), expected)
+                self.assertEqual(self.merge(base, right, left), expected)
+
+    def test_every_distinct_line_replacement_preserves_both_edits(self):
+        base = [f"line {i}\n" for i in range(8)]
+        for i in range(8):
+            for j in range(8):
+                if i == j:
+                    continue
+                left, right, expected = base.copy(), base.copy(), base.copy()
+                left[i] = expected[i] = "LEFT\n"
+                right[j] = expected[j] = "RIGHT\n"
+                self.assertEqual(self.merge("".join(base), "".join(left), "".join(right)), "".join(expected))
+
+    def test_same_line_different_words_still_requires_manual_merge(self):
+        self.assertIsNone(self.merge("first middle last\n", "FIRST middle last\n", "first middle LAST\n"))
+
+    def test_binary_unknown_and_oversized_text_are_not_merged(self):
+        for name in ("image.png", "unknown.bin"):
+            self.assertIsNone(self.merge("a\nb\nc\n", "A\nb\nc\n", "a\nb\nC\n", name))
+        self.assertIsNone(self.merge("a\0\nb\nc\n", "A\0\nb\nc\n", "a\0\nb\nC\n"))
+        self.assertIsNone(s.merge_text("main.tex", b"\xff", s.Entry(b"a", 1), s.Entry(b"b", 2)))
+        with patch.object(s, "MAX_MERGE_BYTES", 3):
+            self.assertIsNone(self.merge("a\nb\nc\n", "A\nb\nc\n", "a\nb\nC\n"))
+        with patch.object(s, "MAX_MERGE_LINES", 2):
+            self.assertIsNone(self.merge("a\nb\nc\n", "A\nb\nc\n", "a\nb\nC\n"))
 
 
 class WebContractTests(unittest.TestCase):
